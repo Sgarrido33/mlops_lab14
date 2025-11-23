@@ -74,10 +74,11 @@ jobs:
         run: |
           python src/features/engineer.py --input data/processed/cleaned_house_data.csv --output data/processed/featured_house_data.csv --preprocessor models/trained/preprocessor.pkl
 
+      # AGREGA ESTO:
       - name: Upload feature engineering artifacts
-              uses: actions/upload-artifact@v4
-              with:
-                name: featured-data
-                path: |
-                  data/processed/featured_house_data.csv
-                  models/trained/preprocessor.pkl
+        uses: actions/upload-artifact@v4
+        with:
+          name: featured-data
+          path: |
+            data/processed/featured_house_data.csv
+            models/trained/preprocessor.pkl
