@@ -42,44 +42,110 @@ jobs:
           name: processed-data
           path: data/processed/
       - run: python src/features/engineer.py --input data/processed/cleaned_house_data.csv --output data/processed/featured_house_data.csv --preprocessor models/trained/preprocessor.pkl
+      
+      # CAMBIO IMPORTANTE: Subimos artifacts por separado para facilitar la vida al job final
       - uses: actions/upload-artifact@v4
         with:
           name: featured-data
-          path: |
-            data/processed/featured_house_data.csv
-            models/trained/preprocessor.pkl
+          path: data/processed/featured_house_data.csv
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preprocessor
+          path: models/trained/preprocessor.pkl
 
   model-training:
-      name: Model Training
-      needs: feature-engineering
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v2
-        - uses: actions/setup-python@v2
-          with:
-            python-version: "3.11.9"
-        - run: pip install -r requirements.txt
-        
-        # Creamos carpetas base (por seguridad)
-        - run: mkdir -p data/processed models/trained configs
-        
-        # CORRECCIÓN: Descargamos en la raíz (path: .) para que restaure la estructura original
-        - uses: actions/download-artifact@v4
-          with:
-            name: featured-data
-            path: .
-        
-        # Verificamos dónde quedaron los archivos (opcional, para debug)
-        - run: ls -R
-        
-        # Entrenar el modelo (ya no hace falta mover nada)
-        - run: |
-            python src/models/train_model.py --config configs/model_config.yaml --data data/processed/featured_house_data.csv --models-dir models
-        
-        # Guardar el modelo entrenado
-        - uses: actions/upload-artifact@v4
-          with:
-            name: trained-model
-            path: |
-              models/trained/house_price_model.pkl
-              models/trained/house_price_model.yaml
+    name: Model Training
+    needs: feature-engineering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: "3.11.9"
+      - run: pip install -r requirements.txt
+      - run: mkdir -p data/processed models/trained configs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: featured-data
+          path: data/processed/
+
+      # Configuramos MLflow temporal para evitar errores de conexión
+      - name: Set up MLflow
+        run: |
+          docker pull ghcr.io/mlflow/mlflow:latest
+          docker run -d -p 5000:5000 --name mlflow-server ghcr.io/mlflow/mlflow:latest mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db
+
+      - name: Wait for MLflow to start
+        run: |
+          for i in {1..10}; do
+            curl -f http://localhost:5000/health || sleep 5;
+          done
+
+      - name: Train model
+        run: |
+          python src/models/train_model.py --config configs/model_config.yaml --data data/processed/featured_house_data.csv --models-dir models --mlflow-tracking-uri http://localhost:5000
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: models/trained/
+
+      - name: Clean up MLflow
+        run: docker stop mlflow-server || true
+
+  build-and-publish:
+    name: Build and Publish
+    needs: [model-training, feature-engineering]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      # Recuperamos el modelo entrenado
+      - uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: models/trained/
+          
+      # Recuperamos el preprocesador (necesario para la API)
+      - uses: actions/download-artifact@v4
+        with:
+          name: preprocessor
+          path: models/trained/
+          
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v2
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Construimos, probamos y subimos la imagen
+      - name: Build, Test and Push
+        run: |
+          # 1. Build con tag de commit
+          COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE_NAME=docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model
+          
+          docker build -t $IMAGE_NAME:$COMMIT_HASH -f Dockerfile .
+          
+          # 2. Test rápido (Health check)
+          docker run -d -p 8000:8000 --name test-api $IMAGE_NAME:$COMMIT_HASH
+          sleep 10
+          if curl -f http://localhost:8000/health; then
+            echo "✅ Health check passed!"
+          else
+            echo "❌ Health check failed!"
+            docker logs test-api
+            exit 1
+          fi
+          docker stop test-api
+          
+          # 3. Push (Versión específica y Latest)
+          docker tag $IMAGE_NAME:$COMMIT_HASH $IMAGE_NAME:latest
+          docker push $IMAGE_NAME:$COMMIT_HASH
+          docker push $IMAGE_NAME:latest
